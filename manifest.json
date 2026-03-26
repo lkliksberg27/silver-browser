@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Silver Browser",
+  "version": "9.0.0",
+  "description": "Alfred — AI voice browsing assistant",
+
+  "permissions": ["storage", "tabs", "alarms", "activeTab", "scripting"],
+  "host_permissions": ["https://api.anthropic.com/*"],
+
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+
+  "commands": {
+    "toggle-voice": {
+      "suggested_key": { "default": "Alt+S" },
+      "description": "Toggle Alfred voice assistant"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

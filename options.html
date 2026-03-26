@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Silver Browser Setup</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:-apple-system,'Segoe UI',Arial,sans-serif; background:#FAFAF5; display:flex; justify-content:center; padding:60px 20px; }
+    .box { max-width:440px; width:100%; }
+    h1 { font-size:28px; color:#1a365d; margin-bottom:8px; }
+    .sub { color:#4a5568; margin-bottom:28px; }
+    label { display:block; font-weight:700; margin-bottom:8px; font-size:15px; }
+    input { width:100%; padding:14px; font-size:16px; border:2px solid #CBD5E0; border-radius:10px; margin-bottom:16px; font-family:monospace; }
+    input:focus { outline:none; border-color:#3182CE; }
+    .btn-row { display:flex; gap:8px; margin-bottom:12px; }
+    .btn { display:block; flex:1; padding:14px; font-size:17px; font-weight:700; border:none; border-radius:12px; cursor:pointer; background:#1a365d; color:#fff; }
+    .btn:hover { background:#2a4f84; }
+    .btn-test { background:#553C9A; flex:0 0 auto; padding:14px 20px; }
+    .btn-test:hover { background:#6B46C1; }
+    .btn:disabled { opacity:.5; cursor:not-allowed; }
+    .saved { color:#276749; font-weight:700; font-size:15px; display:none; margin-bottom:16px; }
+    .test-result { font-weight:700; font-size:15px; display:none; margin-bottom:16px; padding:10px 14px; border-radius:8px; }
+    .test-ok { display:block; background:#C6F6D5; color:#276749; }
+    .test-fail { display:block; background:#FED7D7; color:#9B2C2C; }
+    .test-loading { display:block; background:#E9D8FD; color:#553C9A; }
+    hr { border:none; border-top:1px solid #E2E8F0; margin:24px 0; }
+    .lang-row { display:flex; gap:8px; margin-bottom:16px; }
+    .lang { flex:1; padding:12px; font-size:16px; font-weight:700; border:3px solid #CBD5E0; border-radius:10px; background:#fff; cursor:pointer; text-align:center; }
+    .lang.active { background:#1a365d; color:#fff; border-color:#1a365d; }
+    .hint { font-size:13px; color:#718096; margin-bottom:16px; }
+    .how { background:#EBF8FF; border:2px solid #90CDF4; border-radius:14px; padding:20px; margin-top:24px; font-size:15px; line-height:1.6; }
+    .how strong { color:#1a365d; }
+    .version { text-align:center; color:#A0AEC0; font-size:12px; margin-top:20px; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Silver Browser Setup</h1>
+    <p class="sub">Alfred — voice assistant for browsing</p>
+
+    <label>Anthropic API Key</label>
+    <p class="hint">Get yours at console.anthropic.com</p>
+    <input type="password" id="key" placeholder="sk-ant-..." autocomplete="off">
+    <div class="btn-row">
+      <button class="btn" id="save">Save Key</button>
+      <button class="btn btn-test" id="test">Test</button>
+    </div>
+    <p class="saved" id="saved-msg">Saved!</p>
+    <div class="test-result" id="test-result"></div>
+
+    <hr>
+
+    <label>Language / Idioma</label>
+    <div class="lang-row">
+      <button class="lang active" id="lang-en">English</button>
+      <button class="lang" id="lang-es">Espa&#241;ol</button>
+    </div>
+
+    <div class="how">
+      <strong>How to use:</strong><br><br>
+      1. Click the Silver Browser icon in your toolbar (or press <strong>Alt+S</strong>) to start<br>
+      2. Say <strong>"Alfred"</strong> (or <strong>"Alfredo"</strong> in Spanish) followed by a command<br>
+      3. Alfred stays in conversation for 25 seconds — no need to repeat the wake word<br><br>
+      <strong>Examples:</strong><br>
+      &#8226; "Alfred, read this page"<br>
+      &#8226; "Alfred, open YouTube"<br>
+      &#8226; "Alfred, click the login button"<br>
+      &#8226; "Alfred, search for weather in Miami"<br>
+      &#8226; "Alfred, translate this page"<br>
+      &#8226; "Alfred, make the text bigger"<br>
+      &#8226; "Alfredo, lee esta p&#225;gina"<br>
+      &#8226; "Alfredo, traduce esta p&#225;gina"<br>
+      &#8226; "Alfred, turn off"
+    </div>
+    <p class="version">Silver Browser v9.0</p>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>
