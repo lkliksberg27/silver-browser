@@ -6,17 +6,20 @@
   <style>
     * { margin:0; padding:0; box-sizing:border-box; }
     body { font-family:-apple-system,'Segoe UI',Arial,sans-serif; background:#FAFAF5; display:flex; justify-content:center; padding:60px 20px; }
-    .box { max-width:440px; width:100%; }
+    .box { max-width:480px; width:100%; }
     h1 { font-size:28px; color:#1a365d; margin-bottom:8px; }
     .sub { color:#4a5568; margin-bottom:28px; }
     label { display:block; font-weight:700; margin-bottom:8px; font-size:15px; }
-    input { width:100%; padding:14px; font-size:16px; border:2px solid #CBD5E0; border-radius:10px; margin-bottom:16px; font-family:monospace; }
-    input:focus { outline:none; border-color:#3182CE; }
+    input, select { width:100%; padding:14px; font-size:16px; border:2px solid #CBD5E0; border-radius:10px; margin-bottom:16px; font-family:monospace; }
+    select { font-family:-apple-system,'Segoe UI',Arial,sans-serif; cursor:pointer; }
+    input:focus, select:focus { outline:none; border-color:#3182CE; }
     .btn-row { display:flex; gap:8px; margin-bottom:12px; }
     .btn { display:block; flex:1; padding:14px; font-size:17px; font-weight:700; border:none; border-radius:12px; cursor:pointer; background:#1a365d; color:#fff; }
     .btn:hover { background:#2a4f84; }
     .btn-test { background:#553C9A; flex:0 0 auto; padding:14px 20px; }
     .btn-test:hover { background:#6B46C1; }
+    .btn-eleven { background:#E53E3E; }
+    .btn-eleven:hover { background:#C53030; }
     .btn:disabled { opacity:.5; cursor:not-allowed; }
     .saved { color:#276749; font-weight:700; font-size:15px; display:none; margin-bottom:16px; }
     .test-result { font-weight:700; font-size:15px; display:none; margin-bottom:16px; padding:10px 14px; border-radius:8px; }
@@ -27,9 +30,11 @@
     .lang-row { display:flex; gap:8px; margin-bottom:16px; }
     .lang { flex:1; padding:12px; font-size:16px; font-weight:700; border:3px solid #CBD5E0; border-radius:10px; background:#fff; cursor:pointer; text-align:center; }
     .lang.active { background:#1a365d; color:#fff; border-color:#1a365d; }
-    .hint { font-size:13px; color:#718096; margin-bottom:16px; }
+    .hint { font-size:13px; color:#718096; margin-bottom:16px; line-height:1.5; }
     .how { background:#EBF8FF; border:2px solid #90CDF4; border-radius:14px; padding:20px; margin-top:24px; font-size:15px; line-height:1.6; }
     .how strong { color:#1a365d; }
+    .section-title { font-size:20px; color:#1a365d; margin-bottom:12px; font-weight:700; }
+    .optional { color:#A0AEC0; font-weight:400; font-size:14px; }
     .version { text-align:center; color:#A0AEC0; font-size:12px; margin-top:20px; }
   </style>
 </head>
@@ -38,8 +43,9 @@
     <h1>Silver Browser Setup</h1>
     <p class="sub">Alfred — voice assistant for browsing</p>
 
-    <label>Anthropic API Key</label>
-    <p class="hint">Get yours at console.anthropic.com</p>
+    <!-- Anthropic API Key -->
+    <label>Anthropic API Key <span style="color:#E53E3E">*required</span></label>
+    <p class="hint">Powers Alfred's brain. Get yours at console.anthropic.com</p>
     <input type="password" id="key" placeholder="sk-ant-..." autocomplete="off">
     <div class="btn-row">
       <button class="btn" id="save">Save Key</button>
@@ -50,6 +56,29 @@
 
     <hr>
 
+    <!-- ElevenLabs Voice -->
+    <p class="section-title">Alfred's Voice <span class="optional">(optional)</span></p>
+    <p class="hint">Give Alfred a custom voice with ElevenLabs. Without this, Alfred uses your browser's built-in voice. Get a free key at elevenlabs.io</p>
+
+    <label>ElevenLabs API Key</label>
+    <input type="password" id="eleven-key" placeholder="xi-..." autocomplete="off">
+    <div class="btn-row">
+      <button class="btn btn-eleven" id="eleven-save">Save &amp; Load Voices</button>
+    </div>
+    <div class="test-result" id="eleven-result"></div>
+
+    <label>Voice</label>
+    <select id="eleven-voice">
+      <option value="">Browser default (no ElevenLabs)</option>
+    </select>
+    <div class="btn-row">
+      <button class="btn btn-test" id="eleven-test-voice">Preview Voice</button>
+    </div>
+    <p class="saved" id="eleven-saved">Voice saved!</p>
+
+    <hr>
+
+    <!-- Language -->
     <label>Language / Idioma</label>
     <div class="lang-row">
       <button class="lang active" id="lang-en">English</button>
@@ -58,21 +87,20 @@
 
     <div class="how">
       <strong>How to use:</strong><br><br>
-      1. Click the Silver Browser icon in your toolbar (or press <strong>Alt+S</strong>) to start<br>
-      2. Say <strong>"Alfred"</strong> (or <strong>"Alfredo"</strong> in Spanish) followed by a command<br>
-      3. Alfred stays in conversation for 25 seconds — no need to repeat the wake word<br><br>
+      1. Click the Silver Browser icon (or press <strong>Alt+S</strong>) to start<br>
+      2. Say <strong>"Alfred"</strong> followed by a command<br>
+      3. Alfred stays in conversation for 30 seconds<br><br>
       <strong>Examples:</strong><br>
       &#8226; "Alfred, read this page"<br>
       &#8226; "Alfred, open YouTube"<br>
       &#8226; "Alfred, click the login button"<br>
       &#8226; "Alfred, search for weather in Miami"<br>
       &#8226; "Alfred, translate this page"<br>
-      &#8226; "Alfred, make the text bigger"<br>
-      &#8226; "Alfredo, lee esta p&#225;gina"<br>
-      &#8226; "Alfredo, traduce esta p&#225;gina"<br>
+      &#8226; "Alfred, speak Spanish"<br>
+      &#8226; "Alfred, go back"<br>
       &#8226; "Alfred, turn off"
     </div>
-    <p class="version">Silver Browser v9.0</p>
+    <p class="version">Silver Browser v10.0</p>
   </div>
   <script src="options.js"></script>
 </body>

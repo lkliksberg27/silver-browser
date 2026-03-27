@@ -1,5 +1,5 @@
 /*
- * Silver Browser — Background Service Worker (v9)
+ * Silver Browser — Background Service Worker (v10)
  * Fixes: keepalive, better Claude prompt, retry logic, robust JSON parsing
  */
 
@@ -72,6 +72,8 @@ var SYSTEM = [
   '{"type":"switch_tab","index":N} — switch to tab N',
   '{"type":"search","query":"..."} — Google search',
   '{"type":"scroll","direction":"up|down"} — scroll',
+  '{"type":"go_back"} — browser back button',
+  '{"type":"go_forward"} — browser forward button',
   '{"type":"read_aloud"} — read page aloud',
   '{"type":"simplify"} — simplify text',
   '{"type":"translate","to":"es|en"} — translate page',
@@ -99,7 +101,10 @@ var SYSTEM = [
   '→ Read the page text → {"speak":"This page is about X. It covers Y and Z.","actions":[]}',
   '',
   'User: "go back" / "previous page"',
-  '→ {"speak":"Going back.","actions":[{"type":"navigate","url":"javascript:history.back()"}]}',
+  '→ {"speak":"Going back.","actions":[{"type":"go_back"}]}',
+  '',
+  'User: "go forward" / "next page"',
+  '→ {"speak":"Going forward.","actions":[{"type":"go_forward"}]}',
   '',
   'User: "close this tab"',
   '→ {"speak":"Closing.","actions":[{"type":"close_tab"}]}',
@@ -255,7 +260,70 @@ chrome.runtime.onMessage.addListener(function(msg, sender, reply) {
     return true;
   }
 
-  // ── Test API key ──
+  // ── ElevenLabs TTS ──
+  if (msg.type === 'elevenTTS') {
+    chrome.storage.local.get(['elevenKey', 'elevenVoice'], function(r) {
+      if (!r.elevenKey || !r.elevenVoice) { reply({ error: 'no_eleven_key' }); return; }
+      fetch('https://api.elevenlabs.io/v1/text-to-speech/' + r.elevenVoice + '?output_format=mp3_22050_32', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'xi-api-key': r.elevenKey
+        },
+        body: JSON.stringify({
+          text: msg.text,
+          model_id: 'eleven_flash_v2_5',
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+        })
+      })
+      .then(function(res) {
+        if (!res.ok) {
+          // Try fallback model for free tier
+          if (res.status === 422 || res.status === 400) {
+            return fetch('https://api.elevenlabs.io/v1/text-to-speech/' + r.elevenVoice + '?output_format=mp3_22050_32', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'xi-api-key': r.elevenKey },
+              body: JSON.stringify({ text: msg.text, model_id: 'eleven_monolingual_v1', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
+            }).then(function(res2) { return res2.ok ? res2.blob() : null; });
+          }
+          reply({ error: 'ElevenLabs ' + res.status }); return null;
+        }
+        return res.blob();
+      })
+      .then(function(blob) {
+        if (!blob) return;
+        // Convert blob to base64 in chunks to avoid btoa size limits
+        var reader = new FileReader();
+        reader.onloadend = function() {
+          reply({ audio: reader.result }); // data:audio/mpeg;base64,...
+        };
+        reader.onerror = function() { reply({ error: 'audio encode failed' }); };
+        reader.readAsDataURL(blob);
+      })
+      .catch(function(err) { reply({ error: err.message }); });
+    });
+    return true;
+  }
+
+  // ── Test ElevenLabs key ──
+  if (msg.type === 'testEleven') {
+    fetch('https://api.elevenlabs.io/v1/voices', {
+      headers: { 'xi-api-key': msg.key }
+    })
+    .then(function(res) {
+      if (!res.ok) { reply({ ok: false, status: res.status }); return null; }
+      return res.json();
+    })
+    .then(function(data) {
+      if (!data) return;
+      var voices = (data.voices || []).map(function(v) { return { id: v.voice_id, name: v.name }; });
+      reply({ ok: true, voices: voices });
+    })
+    .catch(function(err) { reply({ ok: false, error: err.message }); });
+    return true;
+  }
+
+  // ── Test Anthropic API key ──
   if (msg.type === 'testKey') {
     fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',

@@ -1,13 +1,14 @@
 /*
- * Silver Browser — Alfred Content Script (v9)
+ * Silver Browser — Alfred Content Script (v10)
  *
- * Fixes over v8:
- * - Speech recognition: proper state machine, no double-start, backoff on errors
- * - Echo prevention: 800ms cooldown after TTS before mic restarts
- * - Wake word: lenient matching (handles STT misrecognitions)
- * - Actions: multi-method click, proper event dispatch
- * - TTS: forced cleanup for Chrome hanging bug
- * - Better visual feedback during processing
+ * Fixes over v9:
+ * - Stop/interrupt works during conversation without false positives
+ * - Scroll/zoom/nav local commands give feedback
+ * - Language auto-detect requires strong evidence before switching
+ * - Same-hostname link filter only applies on search pages
+ * - extractText safe against SVG className objects
+ * - go back/forward/refresh local commands
+ * - Read-aloud chunks use cancel→speak delay fix
  */
 (function() {
   if (document.getElementById('silver-float')) return;
@@ -148,6 +149,7 @@
   }
 
   function interruptAlfred() {
+    if (elevenAudio) { try { elevenAudio.pause(); } catch(e) {} elevenAudio = null; }
     if (window.speechSynthesis) speechSynthesis.cancel();
     speaking = false; speakCooldown = false; isReading = false;
     setProcessing(false);
@@ -162,6 +164,7 @@
   function toggleVoice() {
     isReading = false; speaking = false; speakCooldown = false; conversationActive = false;
     setProcessing(false);
+    if (elevenAudio) { try { elevenAudio.pause(); } catch(e) {} elevenAudio = null; }
     if (window.speechSynthesis) speechSynthesis.cancel();
     listening ? stopListening() : startListening();
   }
@@ -268,52 +271,132 @@
   // ═══════════ TTS — Alfred speaks ═══════════
   var lastSpeakTime = 0; // tracks when speech started (protects from heartbeat cancel)
 
+  // Cache voices once they're loaded
+  var cachedVoices = [];
+  if (window.speechSynthesis) {
+    cachedVoices = speechSynthesis.getVoices();
+    speechSynthesis.addEventListener('voiceschanged', function() { cachedVoices = speechSynthesis.getVoices(); });
+  }
+
+  function pickVoice(langPrefix) {
+    var voices = cachedVoices.length ? cachedVoices : speechSynthesis.getVoices();
+    var fallback = null;
+    for (var i = 0; i < voices.length; i++) {
+      if (voices[i].lang.indexOf(langPrefix) === 0) {
+        if (voices[i].localService) return voices[i]; // prefer local (faster, more reliable)
+        if (!fallback) fallback = voices[i];
+      }
+    }
+    return fallback;
+  }
+
+  function makeUtterance(text, voiceLang) {
+    var utt = new SpeechSynthesisUtterance(text);
+    utt.lang = voiceLang === 'es' ? 'es-ES' : 'en-US';
+    utt.rate = 0.95;
+    var voice = pickVoice(voiceLang === 'es' ? 'es' : 'en');
+    if (voice) utt.voice = voice;
+    return utt;
+  }
+
+  var elevenAudio = null; // current ElevenLabs audio element
+
   function sayOutLoud(text, voiceLang) {
-    if (!window.speechSynthesis || !text) return;
+    if (!text) return;
     speaking = true; speakCooldown = true;
     updateTag();
 
-    // Kill mic so Alfred doesn't hear himself
+    // Kill mic
     if (rec) { try { rec.abort(); } catch(e) {} rec = null; recBusy = false; }
-    speechSynthesis.cancel();
+    if (elevenAudio) { try { elevenAudio.pause(); } catch(e) {} elevenAudio = null; }
+    if (window.speechSynthesis) speechSynthesis.cancel();
 
-    // CRITICAL: Chrome drops speak() if called right after cancel().
-    // 60ms delay fixes the silent-utterance bug.
-    setTimeout(function() {
-      if (!speaking) return; // interrupted during the delay
+    var finished = false;
 
-      var utt = new SpeechSynthesisUtterance(text);
-      utt.lang = voiceLang === 'es' ? 'es-ES' : 'en-US';
-      utt.rate = 0.95;
-      var voices = speechSynthesis.getVoices();
-      var prefix = voiceLang === 'es' ? 'es' : 'en';
-      for (var i = 0; i < voices.length; i++) {
-        if (voices[i].lang.indexOf(prefix) === 0 && voices[i].localService) { utt.voice = voices[i]; break; }
-        if (voices[i].lang.indexOf(prefix) === 0 && !utt.voice) utt.voice = voices[i];
+    function done() {
+      if (finished) return; finished = true;
+      speaking = false;
+      if (elevenAudio) { try { elevenAudio.pause(); } catch(e) {} elevenAudio = null; }
+      updateTag();
+      var coolMs = Math.min(300 + text.length * 5, 1200);
+      setTimeout(function() {
+        speakCooldown = false;
+        if (listening && !speaking && tabIsActive) beginRec();
+      }, coolMs);
+    }
+
+    // Safety timeout
+    var safetyMs = Math.max(6000, text.length * 90);
+    setTimeout(done, safetyMs);
+
+    // Try ElevenLabs first, fall back to browser TTS
+    send({ type: 'elevenTTS', text: text }, function(resp) {
+      if (!speaking || finished) return;
+      if (resp && resp.audio) {
+        // ElevenLabs audio — play via Audio element
+        try {
+          elevenAudio = new Audio(resp.audio);
+          elevenAudio.onended = done;
+          elevenAudio.onerror = function() { elevenAudio = null; browserTTS(); };
+
+          // Try to play — handle autoplay restriction
+          var playPromise = elevenAudio.play();
+          if (playPromise && playPromise.catch) {
+            playPromise.catch(function(err) {
+              // Autoplay blocked — try AudioContext workaround
+              try {
+                var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                fetch(resp.audio).then(function(r) { return r.arrayBuffer(); }).then(function(buf) {
+                  return ctx.decodeAudioData(buf);
+                }).then(function(decoded) {
+                  if (!speaking || finished) { ctx.close(); return; }
+                  var src = ctx.createBufferSource();
+                  src.buffer = decoded;
+                  src.connect(ctx.destination);
+                  src.onended = function() { ctx.close(); done(); };
+                  lastSpeakTime = Date.now();
+                  src.start();
+                }).catch(function() { browserTTS(); });
+              } catch(e2) {
+                // AudioContext also failed — use browser TTS
+                elevenAudio = null;
+                browserTTS();
+              }
+            });
+          }
+          lastSpeakTime = Date.now();
+        } catch(e) { browserTTS(); }
+      } else {
+        browserTTS();
       }
+    });
 
-      var finished = false;
-      function done() {
-        if (finished) return; finished = true;
-        speaking = false;
-        updateTag();
-        // COOLDOWN scales with text length: short replies = fast recovery, long = more echo to clear
-        var coolMs = Math.min(300 + text.length * 5, 1200);
+    function browserTTS() {
+      if (!window.speechSynthesis || !speaking || finished) { if (!finished) done(); return; }
+      speechSynthesis.cancel();
+      var attempts = 0;
+
+      function trySpeak() {
+        if (!speaking || finished) return;
+        attempts++;
+        var utt = makeUtterance(text, voiceLang);
+        utt.onend = done;
+        utt.onerror = function() {
+          if (attempts < 3 && speaking && !finished) setTimeout(trySpeak, 150);
+          else done();
+        };
+        lastSpeakTime = Date.now();
+        speechSynthesis.speak(utt);
         setTimeout(function() {
-          speakCooldown = false;
-          if (listening && !speaking && tabIsActive) beginRec();
-        }, coolMs);
+          if (speaking && !finished && !speechSynthesis.speaking && attempts < 3) {
+            speechSynthesis.cancel();
+            setTimeout(trySpeak, 80);
+          }
+        }, 250);
       }
-      utt.onend = done;
-      utt.onerror = done;
 
-      // Chrome TTS hang safety: force done after generous timeout
-      var safetyMs = Math.max(5000, text.length * 90);
-      setTimeout(done, safetyMs);
-
-      lastSpeakTime = Date.now();
-      speechSynthesis.speak(utt);
-    }, 60);
+      setTimeout(trySpeak, 80);
+    }
   }
 
   // ═══════════ WAKE WORD DETECTION ═══════════
@@ -368,10 +451,17 @@
     }
     startConvo();
 
-    // Detect language from user speech
-    if (/[\u00e1\u00e9\u00ed\u00f3\u00fa\u00f1\u00bf\u00a1]/.test(command) || /\b(esta|p[aá]gina|leer|traduce|abre|qu[eé]|hola|necesito|puedes|por favor|busca|d[ií]me)\b/i.test(command)) {
+    // Detect language from user speech — only switch if strong evidence
+    var hasAccent = /[\u00e1\u00e9\u00ed\u00f3\u00fa\u00f1\u00bf\u00a1]/.test(command);
+    var esHits = (command.match(/\b(esta|p[aá]gina|leer|traduce|abre|qu[eé]|hola|necesito|puedes|por favor|busca|d[ií]me|hacer|tiene|puede|donde|cuando|tambi[eé]n|ahora|todo|como)\b/gi) || []).length;
+    var enHits = (command.match(/\b(the|this|that|open|click|search|please|what|where|when|how|page|read|find|go|close|make)\b/gi) || []).length;
+    // Switch only if clear winner — accents = instant Spanish, otherwise need 2+ hits and lead over other language
+    if (hasAccent || (esHits >= 2 && esHits > enHits)) {
       lang = 'es';
-    } else { lang = 'en'; }
+    } else if (enHits >= 2 && enHits > esHits) {
+      lang = 'en';
+    }
+    // If tied or weak signal, keep current lang
     try { chrome.storage.local.set({ lang: lang }); } catch(e) {}
 
     showStatus((lang === 'es' ? 'T\u00fa: "' : 'You: "') + command + '"', 10000);
@@ -398,80 +488,109 @@
       return;
     }
 
-    if (/\b(scroll down|baja|abajo|go down)\b/.test(t)) { window.scrollBy({ top: 500, behavior: 'smooth' }); return; }
-    if (/\b(scroll up|sube|arriba|go up)\b/.test(t)) { window.scrollBy({ top: -500, behavior: 'smooth' }); return; }
-    if (/\b(go to top|back to top|inicio|principio)\b/.test(t)) { window.scrollTo({ top: 0, behavior: 'smooth' }); return; }
-    if (/\b(go to bottom|final|fondo)\b/.test(t)) { window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); return; }
-    if (/\b(bigger|larger|zoom in|m[aá]s grande|aumenta)\b/.test(t)) { sizeLevel++; document.body.style.zoom = String(1 + sizeLevel * .12); return; }
-    if (/\b(smaller|zoom out|m[aá]s peque|reduce)\b/.test(t)) { sizeLevel--; document.body.style.zoom = String(1 + sizeLevel * .12); return; }
-    if (/\b(reset size|normal size|tama[nñ]o normal)\b/.test(t)) { sizeLevel = 0; document.body.style.zoom = '1'; return; }
-    if (/\b(contrast|dark mode|contraste|modo oscuro)\b/.test(t)) { contrastOn = !contrastOn; document.body.classList.toggle('silver-high-contrast', contrastOn); return; }
+    if (/\b(scroll down|baja|abajo|go down)\b/.test(t)) { window.scrollBy({ top: 500, behavior: 'smooth' }); showStatus(lang === 'es' ? 'Bajando.' : 'Scrolling down.', 1500); return; }
+    if (/\b(scroll up|sube|arriba|go up)\b/.test(t)) { window.scrollBy({ top: -500, behavior: 'smooth' }); showStatus(lang === 'es' ? 'Subiendo.' : 'Scrolling up.', 1500); return; }
+    if (/\b(go to top|back to top|inicio|principio)\b/.test(t)) { window.scrollTo({ top: 0, behavior: 'smooth' }); showStatus(lang === 'es' ? 'Inicio de p\u00e1gina.' : 'Top of page.', 1500); return; }
+    if (/\b(go to bottom|final|fondo)\b/.test(t)) { window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); showStatus(lang === 'es' ? 'Final de p\u00e1gina.' : 'Bottom of page.', 1500); return; }
+    if (/\b(bigger|larger|zoom in|m[aá]s grande|aumenta)\b/.test(t)) { sizeLevel++; document.body.style.zoom = String(1 + sizeLevel * .12); showStatus(lang === 'es' ? 'M\u00e1s grande.' : 'Bigger.', 1500); return; }
+    if (/\b(smaller|zoom out|m[aá]s peque|reduce)\b/.test(t)) { sizeLevel--; document.body.style.zoom = String(1 + sizeLevel * .12); showStatus(lang === 'es' ? 'M\u00e1s peque\u00f1o.' : 'Smaller.', 1500); return; }
+    if (/\b(reset size|normal size|tama[nñ]o normal)\b/.test(t)) { sizeLevel = 0; document.body.style.zoom = '1'; showStatus(lang === 'es' ? 'Tama\u00f1o normal.' : 'Normal size.', 1500); return; }
+    if (/\b(contrast|dark mode|contraste|modo oscuro)\b/.test(t)) { contrastOn = !contrastOn; document.body.classList.toggle('silver-high-contrast', contrastOn); showStatus(contrastOn ? (lang === 'es' ? 'Contraste alto activado.' : 'High contrast on.') : (lang === 'es' ? 'Contraste normal.' : 'Normal contrast.'), 1500); return; }
     if (/\b(stop listening|turn off|ap[aá]gate|desactivar)\b/.test(t)) { stopListening(); return; }
-    if (/\b(stop|shut up|quiet|be quiet|c[aá]llate|silencio|para de hablar)\b/.test(t) && !conversationActive) { interruptAlfred(); return; }
-    if (/\b(stop reading|stop talking|c[aá]llate|silencio|shut up)\b/.test(t)) { stopReading(); if (window.speechSynthesis) speechSynthesis.cancel(); speaking = false; speakCooldown = false; return; }
+    // Unified stop/interrupt: works both in and out of conversation.
+    // Only trigger on short utterances (3 words or fewer) to avoid false positives like "don't stop the music".
+    if (t.split(/\s+/).length <= 3 && /\b(stop|shut up|quiet|be quiet|c[aá]llate|silencio|para de hablar|stop reading|stop talking)\b/.test(t)) {
+      if (isReading) { stopReading(); }
+      if (window.speechSynthesis) speechSynthesis.cancel();
+      speaking = false; speakCooldown = false;
+      interruptAlfred();
+      return;
+    }
+    // Browser navigation: go back / go forward
+    if (/\b(go back|back|atr[aá]s|volver|previous page|p[aá]gina anterior)\b/.test(t) && !/\b(go back to top)\b/.test(t)) { window.history.back(); showStatus(lang === 'es' ? 'Volviendo.' : 'Going back.', 2000); return; }
+    if (/\b(go forward|forward|adelante|siguiente|next page|p[aá]gina siguiente)\b/.test(t)) { window.history.forward(); showStatus(lang === 'es' ? 'Adelante.' : 'Going forward.', 2000); return; }
+    if (/\b(refresh|reload|actualizar|recargar)\b/.test(t)) { showStatus(lang === 'es' ? 'Recargando.' : 'Refreshing.', 1500); window.location.reload(); return; }
+
     if (/^(read|lee|l[eé]eme|read this|read the page|leer)/i.test(t)) { readPageAloud(); return; }
     if (/\b(close|cerrar)\b/.test(t) && /\b(reader|overlay|vista)\b/.test(t)) { closeReader(); return; }
 
     // ── Send to Claude ──
     setProcessing(true);
-    var page = getPageContext();
+    var page;
+    try {
+      page = getPageContext();
+    } catch(e) {
+      // Page context failed — use minimal info so Alfred can still respond
+      page = { url: window.location.href, title: document.title || '', text: '', headings: 'none', clickables: 'none' };
+    }
+
     var claudeTimeout = setTimeout(function() {
       setProcessing(false);
       showStatus(lang === 'es' ? 'Sin respuesta. Int\u00e9ntalo de nuevo.' : 'No response. Try again.', 4000);
     }, 15000);
 
     send({ type: 'getTabs' }, function(tr) {
-      var tabs = (tr && tr.tabs) ? tr.tabs : '';
-      var msg = [
-        'User said: "' + command + '"',
-        '',
-        'Current page: ' + page.url,
-        'Title: ' + page.title,
-        '',
-        'Headings:',
-        page.headings || 'none',
-        '',
-        'Page text (excerpt):',
-        page.text || 'none',
-        '',
-        'Page elements (click by index number):',
-        page.clickables || 'none',
-        tabs ? '\nOpen tabs:\n' + tabs : ''
-      ].join('\n');
+      try {
+        var tabs = (tr && tr.tabs) ? tr.tabs : '';
+        var msg = [
+          'User said: "' + command + '"',
+          '',
+          'Current page: ' + page.url,
+          'Title: ' + page.title,
+          '',
+          'Headings:',
+          page.headings || 'none',
+          '',
+          'Page text (excerpt):',
+          page.text || 'none',
+          '',
+          'Page elements (click by index number):',
+          page.clickables || 'none',
+          tabs ? '\nOpen tabs:\n' + tabs : ''
+        ].join('\n');
 
-      history.push({ role: 'user', content: msg });
-      if (history.length > 10) history = history.slice(-8);
-
-      send({ type: 'alfred', history: history.slice() }, function(resp) {
-        clearTimeout(claudeTimeout);
-        setProcessing(false);
-
-        if (!resp || resp.error) {
-          var errMsg = resp ? resp.error : 'connection lost';
-          if (errMsg === 'no_key') {
-            showStatus(lang === 'es' ? 'Configura tu API key primero.' : 'Set your API key first (click extension icon > options).', 8000);
-          } else {
-            showStatus('Error: ' + errMsg, 5000);
-          }
-          return;
-        }
-
-        var r = resp.result;
-        if (!r) return;
-
-        history.push({ role: 'assistant', content: JSON.stringify(r) });
+        history.push({ role: 'user', content: msg });
         if (history.length > 10) history = history.slice(-8);
 
-        if (r.actions && r.actions.length) executeActions(r.actions);
-        if (r.speak) {
-          var rl = detectLang(r.speak);
-          if (rl !== lang) { lang = rl; try { chrome.storage.local.set({ lang: lang }); } catch(e) {} }
-          showStatus('Alfred: ' + r.speak);
-          sayOutLoud(r.speak, lang);
-        }
-        // Reset conversation timer so user has 30s to reply after Alfred speaks
-        startConvo();
-      });
+        send({ type: 'alfred', history: history.slice() }, function(resp) {
+          try {
+            clearTimeout(claudeTimeout);
+            setProcessing(false);
+
+            if (!resp || resp.error) {
+              var errMsg = resp ? resp.error : 'connection lost';
+              if (errMsg === 'no_key') {
+                showStatus(lang === 'es' ? 'Configura tu API key primero.' : 'Set your API key first.', 8000);
+              } else {
+                showStatus('Error: ' + errMsg, 5000);
+              }
+              return;
+            }
+
+            var r = resp.result;
+            if (!r) { showStatus('No response from Alfred.', 3000); return; }
+
+            history.push({ role: 'assistant', content: JSON.stringify(r) });
+            if (history.length > 10) history = history.slice(-8);
+
+            if (r.actions && r.actions.length) executeActions(r.actions);
+            if (r.speak) {
+              var rl = detectLang(r.speak);
+              if (rl !== lang) { lang = rl; try { chrome.storage.local.set({ lang: lang }); } catch(e) {} }
+              showStatus('Alfred: ' + r.speak);
+              sayOutLoud(r.speak, lang);
+            }
+            startConvo();
+          } catch(e) {
+            setProcessing(false);
+            showStatus('Error: ' + (e.message || 'unknown'), 5000);
+          }
+        });
+      } catch(e) {
+        clearTimeout(claudeTimeout);
+        setProcessing(false);
+        showStatus('Error: ' + (e.message || 'unknown'), 5000);
+      }
     });
   }
 
@@ -532,23 +651,29 @@
       // Kill mic while speaking this chunk
       if (rec) { try { rec.abort(); } catch(e) {} rec = null; recBusy = false; }
       speaking = true; speakCooldown = true;
+      speechSynthesis.cancel();
 
-      var utt = new SpeechSynthesisUtterance(chunk);
-      utt.lang = pl === 'es' ? 'es-ES' : 'en-US';
-      utt.rate = 0.88;
-      if (voice) utt.voice = voice;
-      var myOff = offset;
-      utt.onboundary = function(e) { if (e.name === 'word') highlightWord(myOff + e.charIndex); };
-      utt.onend = function() {
-        offset += chunk.length + 1; ci++;
-        if (isReading) {
-          // Brief mic window between chunks
-          enableMicBriefly();
-          setTimeout(next, 400);
-        }
-      };
-      utt.onerror = function() { isReading = false; speaking = false; speakCooldown = false; };
-      speechSynthesis.speak(utt);
+      // CRITICAL: Chrome drops speak() if called right after cancel(). 60ms delay fixes it.
+      setTimeout(function() {
+        if (!isReading) return; // interrupted during the delay
+
+        var utt = new SpeechSynthesisUtterance(chunk);
+        utt.lang = pl === 'es' ? 'es-ES' : 'en-US';
+        utt.rate = 0.88;
+        if (voice) utt.voice = voice;
+        var myOff = offset;
+        utt.onboundary = function(e) { if (e.name === 'word') highlightWord(myOff + e.charIndex); };
+        utt.onend = function() {
+          offset += chunk.length + 1; ci++;
+          if (isReading) {
+            // Brief mic window between chunks
+            enableMicBriefly();
+            setTimeout(next, 400);
+          }
+        };
+        utt.onerror = function() { isReading = false; speaking = false; speakCooldown = false; };
+        speechSynthesis.speak(utt);
+      }, 60);
     }
     next();
   }
@@ -599,11 +724,9 @@
     if (!href) return '';
     try {
       var u = new URL(href);
-      // Google redirect: /url?q=REAL_URL
       if ((u.hostname.indexOf('google.') !== -1) && u.pathname === '/url' && u.searchParams.has('q')) {
         return u.searchParams.get('q');
       }
-      // Bing redirect
       if (u.hostname.indexOf('bing.') !== -1 && u.pathname === '/ck/a' && u.searchParams.has('u')) {
         try { return decodeURIComponent(u.searchParams.get('u').replace(/^a1/, '')); } catch(e) {}
       }
@@ -611,121 +734,128 @@
     return href;
   }
 
-  // Check if an element is inside navigation/chrome (not main content)
+  // Quick nav check — only look at direct parent tags/roles, skip expensive class scanning
   function isNavElement(el) {
-    var node = el;
-    for (var depth = 0; node && depth < 8; depth++) {
-      var tag = (node.tagName || '').toLowerCase();
-      var role = node.getAttribute ? (node.getAttribute('role') || '') : '';
-      var cls = (node.className || '').toString().toLowerCase();
-      var id = (node.id || '').toLowerCase();
-      if (tag === 'nav' || role === 'navigation' || role === 'banner' || role === 'contentinfo' ||
-          /\b(nav|header|footer|sidebar|menu|toolbar|cookie|consent|popup|modal|overlay)\b/.test(cls + ' ' + id)) {
-        return true;
+    try {
+      var node = el;
+      for (var depth = 0; node && depth < 5; depth++) {
+        var tag = (node.tagName || '').toLowerCase();
+        if (tag === 'nav' || tag === 'footer' || tag === 'header') return true;
+        if (tag === 'main' || tag === 'article') return false;
+        var role = node.getAttribute ? (node.getAttribute('role') || '') : '';
+        if (role === 'navigation' || role === 'banner' || role === 'contentinfo') return true;
+        if (role === 'main') return false;
+        var id = (node.id || '').toLowerCase();
+        // Only check ID (fast), skip className (slow on SVG, unreliable on Google)
+        if (/^(nav|footer|sidebar|cookie-banner)/.test(id)) return true;
+        if (/^(search|rso|main|content|results)/.test(id)) return false;
+        node = node.parentElement;
       }
-      if (tag === 'main' || tag === 'article' || role === 'main') return false; // inside main = good
-      node = node.parentElement;
-    }
+    } catch(e) {}
     return false;
   }
 
   function getPageContext() {
     clickables = [];
     var cl = [];
-    var selectors = 'a[href], button, [role="button"], [role="link"], [role="tab"], [role="menuitem"], input, select, textarea, [onclick], [tabindex]:not([tabindex="-1"]), [class*="btn"], summary, details > summary, label[for]';
-    var allEls = document.querySelectorAll(selectors);
 
-    // Separate into main-content elements (priority) and UI/nav elements
-    var mainEls = [], uiEls = [];
-    for (var i = 0; i < allEls.length; i++) {
-      if (isNavElement(allEls[i])) uiEls.push(allEls[i]);
-      else mainEls.push(allEls[i]);
-    }
+    try {
+      // On search pages, target result containers directly first
+      var isSearchPage = /google\.\w+\/search|bing\.\w+\/search|duckduckgo\.com/.test(window.location.hostname + window.location.pathname);
+      var maxTotal = 50;
+      var seenHrefs = {};
 
-    // Process main content first (up to 45 slots), then UI elements (remaining slots)
-    var maxMain = 45, maxTotal = 60;
-    var seenHrefs = {}; // dedup by actual destination, not text
-
-    function addElement(el) {
-      if (clickables.length >= maxTotal) return;
-      var tag = el.tagName.toLowerCase(), txt = '';
-
-      // Skip hidden/invisible
-      try {
-        var r = el.getBoundingClientRect();
-        if (r.width < 1 || r.height < 1) return;
-        var style = getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return;
-      } catch(e) { return; }
-
-      if (tag === 'input') txt = '[input:' + (el.type || 'text') + '] ' + (el.placeholder || el.name || el.getAttribute('aria-label') || el.value || '');
-      else if (tag === 'select') txt = '[select] ' + (el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex].text : '');
-      else if (tag === 'textarea') txt = '[textarea] ' + (el.placeholder || '');
-      else {
-        // For links, prefer the closest heading or direct text over deep textContent
-        var directTxt = '';
-        var h3 = el.querySelector('h3, h2, h1');
-        if (h3) directTxt = h3.textContent.trim();
-        if (!directTxt) {
-          // Get shallow text (not deeply nested nav menus)
-          directTxt = (el.getAttribute('aria-label') || el.textContent || el.value || el.title || '').trim();
-        }
-        txt = directTxt.replace(/\s+/g, ' ');
-      }
-      txt = txt.slice(0, 100);
-      if (!txt || txt.length < 2) return;
-
-      // Smart dedup: for links, dedup by cleaned href; for others, by text
-      var rawHref = el.href ? cleanHref(el.href) : '';
-      if (rawHref) {
-        // Skip internal Google/Bing navigation links
+      function addEl(el) {
+        if (clickables.length >= maxTotal) return;
         try {
-          var hu = new URL(rawHref);
-          if (hu.hostname === window.location.hostname && /^\/(search|webhp|#|$)/.test(hu.pathname)) return;
-        } catch(e) {}
-        // Dedup by destination URL
-        var hrefKey = rawHref.split('?')[0].split('#')[0]; // base URL without params
-        if (seenHrefs[hrefKey]) return;
-        seenHrefs[hrefKey] = true;
-      } else {
-        // Dedup non-link elements by exact text
-        var txtKey = txt.slice(0, 40);
-        if (seenHrefs['txt:' + txtKey]) return;
-        seenHrefs['txt:' + txtKey] = true;
+          var tag = el.tagName.toLowerCase(), txt = '';
+          var r = el.getBoundingClientRect();
+          if (r.width < 1 || r.height < 1) return;
+
+          if (tag === 'input') txt = '[input:' + (el.type || 'text') + '] ' + (el.placeholder || el.name || el.getAttribute('aria-label') || el.value || '');
+          else if (tag === 'select') txt = '[select] ' + (el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex].text : '');
+          else if (tag === 'textarea') txt = '[textarea] ' + (el.placeholder || '');
+          else {
+            var h3 = el.querySelector('h3, h2, h1');
+            if (h3) txt = h3.textContent.trim();
+            if (!txt) txt = (el.getAttribute('aria-label') || el.innerText || el.textContent || el.title || '').trim();
+            txt = txt.replace(/\s+/g, ' ');
+          }
+          txt = txt.slice(0, 100);
+          if (!txt || txt.length < 2) return;
+
+          var rawHref = el.href ? cleanHref(el.href) : '';
+          if (rawHref) {
+            // Skip same-site links only on search result pages (not on regular sites where internal links are useful)
+            try {
+              var hu = new URL(rawHref);
+              if (isSearchPage && hu.hostname === window.location.hostname) return;
+            } catch(e) {}
+            var hrefKey = rawHref.split('?')[0].split('#')[0];
+            if (seenHrefs[hrefKey]) return;
+            seenHrefs[hrefKey] = true;
+          } else {
+            var txtKey = txt.slice(0, 40);
+            if (seenHrefs['txt:' + txtKey]) return;
+            seenHrefs['txt:' + txtKey] = true;
+          }
+
+          clickables.push(el);
+          var displayHref = rawHref ? ' -> ' + rawHref.slice(0, 100) : '';
+          cl.push((clickables.length - 1) + '. [' + tag + '] ' + txt + displayHref);
+        } catch(e) { /* skip this element */ }
       }
 
-      clickables.push(el);
-      var displayHref = rawHref ? ' -> ' + rawHref.slice(0, 100) : '';
-      cl.push((clickables.length - 1) + '. [' + tag + '] ' + txt + displayHref);
+      // PASS 1: If search page, grab result links directly from known containers
+      if (isSearchPage) {
+        var resultContainers = document.querySelectorAll('#rso a[href], #search a[href], #links a[href], .results a[href], [data-snf] a[href], .react-results--main a[href]');
+        for (var r = 0; r < resultContainers.length && clickables.length < 35; r++) {
+          addEl(resultContainers[r]);
+        }
+      }
+
+      // PASS 2: Main content elements (skip nav)
+      var selectors = 'a[href], button, [role="button"], input[type="text"], input[type="search"], textarea, select';
+      var allEls = document.querySelectorAll(selectors);
+      // Cap how many we even look at — Google can have 1000+ matches
+      var scanLimit = Math.min(allEls.length, 300);
+      for (var i = 0; i < scanLimit && clickables.length < maxTotal - 5; i++) {
+        if (!isNavElement(allEls[i])) addEl(allEls[i]);
+      }
+
+      // PASS 3: Grab a few UI elements (buttons, inputs) for completeness
+      for (var u = 0; u < scanLimit && clickables.length < maxTotal; u++) {
+        if (isNavElement(allEls[u])) addEl(allEls[u]);
+      }
+
+    } catch(e) {
+      // getPageContext crashed — return minimal context so Alfred still works
+      clickables = [];
+      cl = [];
     }
 
-    // Pass 1: main content elements (search results, article links, etc.)
-    for (var m = 0; m < mainEls.length && clickables.length < maxMain; m++) {
-      addElement(mainEls[m]);
-    }
-    // Pass 2: UI elements (nav, buttons, etc.) fill remaining slots
-    for (var u = 0; u < uiEls.length && clickables.length < maxTotal; u++) {
-      addElement(uiEls[u]);
-    }
+    var hd = [];
+    try {
+      var hs = document.querySelectorAll('h1, h2, h3');
+      for (var h = 0; h < hs.length && hd.length < 12; h++) {
+        var ht = hs[h].textContent.trim().slice(0, 120);
+        if (ht) hd.push(hs[h].tagName + ': ' + ht);
+      }
+    } catch(e) {}
 
-    var hd = [], hs = document.querySelectorAll('h1, h2, h3');
-    for (var h = 0; h < hs.length && hd.length < 12; h++) {
-      var ht = hs[h].textContent.trim().slice(0, 120);
-      if (ht) hd.push(hs[h].tagName + ': ' + ht);
-    }
-
-    // Detect page type to help Claude
     var pageHint = '';
-    var loc = window.location.hostname + window.location.pathname;
-    if (/google\.\w+\/search/.test(loc)) pageHint = '[PAGE TYPE: Google search results. Elements above are the search result links — click them to navigate.]\n';
-    else if (/bing\.\w+\/search/.test(loc)) pageHint = '[PAGE TYPE: Bing search results. Elements above are the result links.]\n';
-    else if (/duckduckgo\.com/.test(loc)) pageHint = '[PAGE TYPE: DuckDuckGo search results.]\n';
-    else if (/youtube\.com/.test(loc)) pageHint = '[PAGE TYPE: YouTube. Elements include video links — click to watch.]\n';
+    try {
+      var loc = window.location.hostname + window.location.pathname;
+      if (/google\.\w+\/search/.test(loc)) pageHint = '[PAGE TYPE: Google search results. The elements below are search result links. Click them by index to navigate to that site.]\n';
+      else if (/bing\.\w+\/search/.test(loc)) pageHint = '[PAGE TYPE: Bing search results. Click elements by index to navigate.]\n';
+      else if (/duckduckgo\.com/.test(loc)) pageHint = '[PAGE TYPE: DuckDuckGo results.]\n';
+      else if (/youtube\.com/.test(loc)) pageHint = '[PAGE TYPE: YouTube. Click video links to watch.]\n';
+    } catch(e) {}
 
     return {
       url: window.location.href,
-      title: document.title,
-      text: extractText().slice(0, 5000),
+      title: document.title || '',
+      text: (function() { try { return extractText().slice(0, 5000); } catch(e) { return ''; } })(),
       headings: hd.join('\n') || 'none',
       clickables: pageHint + (cl.join('\n') || 'none')
     };
@@ -766,25 +896,43 @@
       case 'click':
         if (typeof a.index === 'number' && a.index >= 0 && a.index < clickables.length) {
           var el = clickables[a.index];
+          // Check element is still in DOM (SPAs can re-render between context gather and click)
+          if (!document.body.contains(el)) {
+            showStatus(lang === 'es' ? 'Elemento desapareci\u00f3. Intenta de nuevo.' : 'Element gone. Try again.', 3000);
+            break;
+          }
           el.scrollIntoView({ behavior: 'smooth', block: 'center' });
           setTimeout(function() {
-            // For links: get the REAL destination (bypass Google/Bing redirects)
-            if (el.tagName === 'A' && el.href) {
-              var realUrl = cleanHref(el.href);
-              showStatus(lang === 'es' ? 'Abriendo...' : 'Opening...', 2000);
-              if (el.target === '_blank') {
-                send({ type: 'tabAction', action: 'new_tab', url: realUrl });
-              } else {
-                window.location.href = realUrl;
-              }
-              return;
-            }
-            // For non-links: try multiple click methods
-            try { el.focus(); } catch(e) {}
-            try { el.click(); } catch(e) {}
             try {
-              el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-            } catch(e) {}
+              // For links: direct navigate (most reliable, bypasses any JS interference)
+              if (el.tagName === 'A' && el.href) {
+                var realUrl = cleanHref(el.href);
+                showStatus(lang === 'es' ? 'Abriendo...' : 'Opening...', 2000);
+                if (el.target === '_blank') {
+                  send({ type: 'tabAction', action: 'new_tab', url: realUrl });
+                } else {
+                  window.location.href = realUrl;
+                }
+                return;
+              }
+              // For everything else: full event chain that works on ANY framework
+              var rect = el.getBoundingClientRect();
+              var cx = rect.left + rect.width / 2;
+              var cy = rect.top + rect.height / 2;
+              var evtOpts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy };
+              try { el.focus(); } catch(e) {}
+              // Pointer events (React, modern SPAs)
+              el.dispatchEvent(new PointerEvent('pointerdown', evtOpts));
+              el.dispatchEvent(new MouseEvent('mousedown', evtOpts));
+              el.dispatchEvent(new MouseEvent('mouseup', evtOpts));
+              el.dispatchEvent(new PointerEvent('pointerup', evtOpts));
+              el.dispatchEvent(new MouseEvent('click', evtOpts));
+              // Native click as fallback
+              try { el.click(); } catch(e) {}
+            } catch(e) {
+              // Last resort
+              try { el.click(); } catch(e2) {}
+            }
           }, 350);
         } else {
           showStatus(lang === 'es' ? 'Elemento no encontrado.' : 'Element not found.', 3000);
@@ -796,23 +944,88 @@
           var inp = clickables[a.index];
           inp.scrollIntoView({ behavior: 'smooth', block: 'center' });
           setTimeout(function() {
-            try { inp.focus(); } catch(e) {}
-            // Clear existing value
-            inp.value = '';
-            inp.dispatchEvent(new Event('input', { bubbles: true }));
-            // Type new value
-            inp.value = a.text;
-            inp.dispatchEvent(new Event('input', { bubbles: true }));
-            inp.dispatchEvent(new Event('change', { bubbles: true }));
-            // If it's a search input, optionally submit
-            var form = inp.closest('form');
-            if (form && /search/i.test((form.action || '') + (form.className || '') + (inp.name || '') + (inp.type || ''))) {
-              setTimeout(function() { form.submit(); }, 300);
+            try { inp.focus(); inp.click(); } catch(e) {}
+            var isContentEditable = inp.isContentEditable || inp.getAttribute('contenteditable') === 'true';
+            var tag = inp.tagName.toLowerCase();
+
+            // Get the right native setter (cached outside loop for performance)
+            var nativeSetter = null;
+            if (tag === 'textarea') {
+              nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+            } else if (tag === 'input') {
+              nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
             }
+
+            // Clear field first
+            if (isContentEditable) {
+              inp.textContent = '';
+            } else if (nativeSetter && nativeSetter.set) {
+              nativeSetter.set.call(inp, '');
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+            } else {
+              inp.value = '';
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+
+            // Type character by character — works on React, Angular, Vue, plain HTML, everything
+            var chars = a.text.split('');
+            var ci = 0;
+            function typeChar() {
+              if (ci >= chars.length) {
+                // Done — fire final events and optionally submit
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+                var form = inp.closest ? inp.closest('form') : null;
+                if (form && /search/i.test((form.action || '') + (form.className || '') + (inp.name || '') + (inp.type || ''))) {
+                  setTimeout(function() {
+                    var enterOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+                    inp.dispatchEvent(new KeyboardEvent('keydown', enterOpts));
+                    inp.dispatchEvent(new KeyboardEvent('keypress', enterOpts));
+                    inp.dispatchEvent(new KeyboardEvent('keyup', enterOpts));
+                    setTimeout(function() { try { form.submit(); } catch(e) {} }, 200);
+                  }, 150);
+                }
+                return;
+              }
+              var ch = chars[ci];
+              var kOpts = { key: ch, code: 'Key' + ch.toUpperCase(), bubbles: true, cancelable: true };
+
+              // keydown + keypress first
+              inp.dispatchEvent(new KeyboardEvent('keydown', kOpts));
+              inp.dispatchEvent(new KeyboardEvent('keypress', kOpts));
+
+              if (isContentEditable) {
+                // For contentEditable: use execCommand (most reliable)
+                try { document.execCommand('insertText', false, ch); } catch(e) { inp.textContent += ch; }
+              } else {
+                // For regular inputs: native setter + InputEvent with insertText type
+                if (nativeSetter && nativeSetter.set) {
+                  nativeSetter.set.call(inp, inp.value + ch);
+                } else {
+                  inp.value += ch;
+                }
+                // InputEvent with inputType tells frameworks exactly what happened
+                try {
+                  inp.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ch }));
+                } catch(e) {
+                  inp.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+              }
+
+              inp.dispatchEvent(new KeyboardEvent('keyup', kOpts));
+              ci++;
+              setTimeout(typeChar, 20);
+            }
+            typeChar();
           }, 300);
         }
         break;
 
+      case 'go_back':
+        window.history.back();
+        break;
+      case 'go_forward':
+        window.history.forward();
+        break;
       case 'scroll':
         window.scrollBy({ top: a.direction === 'up' ? -500 : 500, behavior: 'smooth' });
         break;
@@ -853,7 +1066,8 @@
     for (var d = 0; d < divs.length; d++) {
       var t = divs[d].innerText; if (!t) continue;
       var l = t.trim().length;
-      var info = (divs[d].tagName + (divs[d].getAttribute('role') || '') + (divs[d].className || '')).toLowerCase();
+      var cn = ''; try { cn = typeof divs[d].className === 'string' ? divs[d].className : String(divs[d].className || ''); } catch(e) {}
+      var info = (divs[d].tagName + (divs[d].getAttribute('role') || '') + cn).toLowerCase();
       if (l > bl && l > 300 && !/nav|footer|sidebar|menu|header|banner|cookie|consent|popup|modal/i.test(info)) { best = divs[d]; bl = l; }
     }
     if (best) return clean(best.innerText);
@@ -929,12 +1143,6 @@
   }, 2000);
 
   // ═══════════ INIT ═══════════
-  // Preload voices — Chrome loads them async, first getVoices() call returns empty
-  if (window.speechSynthesis) {
-    speechSynthesis.getVoices();
-    speechSynthesis.addEventListener('voiceschanged', function() { speechSynthesis.getVoices(); });
-  }
-
   if (document.body) injectUI();
   else document.addEventListener('DOMContentLoaded', injectUI);
 })();

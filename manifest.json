@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Silver Browser",
-  "version": "9.0.0",
+  "version": "10.0.0",
   "description": "Alfred — AI voice browsing assistant",
 
   "permissions": ["storage", "tabs", "alarms", "activeTab", "scripting"],
-  "host_permissions": ["https://api.anthropic.com/*"],
+  "host_permissions": ["https://api.anthropic.com/*", "https://api.elevenlabs.io/*"],
 
   "action": {
     "default_icon": {
