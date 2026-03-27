@@ -142,8 +142,8 @@ function callClaude(apiKey, messages, attempt, callback) {
       'anthropic-dangerous-direct-browser-access': 'true'
     },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 800,
+      model: 'claude-sonnet-4-5-20241022',
+      max_tokens: 1024,
       system: SYSTEM,
       messages: messages
     })
@@ -334,7 +334,7 @@ chrome.runtime.onMessage.addListener(function(msg, sender, reply) {
         'anthropic-dangerous-direct-browser-access': 'true'
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
+        model: 'claude-sonnet-4-5-20241022',
         max_tokens: 20,
         messages: [{ role: 'user', content: 'Say "OK"' }]
       })

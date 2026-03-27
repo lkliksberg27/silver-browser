@@ -329,42 +329,24 @@
     var safetyMs = Math.max(6000, text.length * 90);
     setTimeout(done, safetyMs);
 
-    // Try ElevenLabs first, fall back to browser TTS
+    // Try ElevenLabs with 3s timeout, fall back to browser TTS
+    var usedEleven = false;
+    var elevenTimer = setTimeout(function() {
+      // ElevenLabs too slow — skip to browser TTS
+      if (!usedEleven && speaking && !finished) browserTTS();
+    }, 3000);
+
     send({ type: 'elevenTTS', text: text }, function(resp) {
+      clearTimeout(elevenTimer);
       if (!speaking || finished) return;
       if (resp && resp.audio) {
-        // ElevenLabs audio — play via Audio element
+        usedEleven = true;
         try {
           elevenAudio = new Audio(resp.audio);
           elevenAudio.onended = done;
           elevenAudio.onerror = function() { elevenAudio = null; browserTTS(); };
-
-          // Try to play — handle autoplay restriction
-          var playPromise = elevenAudio.play();
-          if (playPromise && playPromise.catch) {
-            playPromise.catch(function(err) {
-              // Autoplay blocked — try AudioContext workaround
-              try {
-                var ctx = new (window.AudioContext || window.webkitAudioContext)();
-                fetch(resp.audio).then(function(r) { return r.arrayBuffer(); }).then(function(buf) {
-                  return ctx.decodeAudioData(buf);
-                }).then(function(decoded) {
-                  if (!speaking || finished) { ctx.close(); return; }
-                  var src = ctx.createBufferSource();
-                  src.buffer = decoded;
-                  src.connect(ctx.destination);
-                  src.onended = function() { ctx.close(); done(); };
-                  lastSpeakTime = Date.now();
-                  src.start();
-                }).catch(function() { browserTTS(); });
-              } catch(e2) {
-                // AudioContext also failed — use browser TTS
-                elevenAudio = null;
-                browserTTS();
-              }
-            });
-          }
           lastSpeakTime = Date.now();
+          elevenAudio.play().catch(function() { elevenAudio = null; browserTTS(); });
         } catch(e) { browserTTS(); }
       } else {
         browserTTS();
@@ -372,30 +354,26 @@
     });
 
     function browserTTS() {
-      if (!window.speechSynthesis || !speaking || finished) { if (!finished) done(); return; }
+      if (usedEleven || !speaking || finished) { if (!finished && !usedEleven) done(); return; }
+      if (!window.speechSynthesis) { done(); return; }
+      usedEleven = true; // prevent double-fire
       speechSynthesis.cancel();
-      var attempts = 0;
-
-      function trySpeak() {
+      setTimeout(function() {
         if (!speaking || finished) return;
-        attempts++;
         var utt = makeUtterance(text, voiceLang);
         utt.onend = done;
-        utt.onerror = function() {
-          if (attempts < 3 && speaking && !finished) setTimeout(trySpeak, 150);
-          else done();
-        };
+        utt.onerror = done;
         lastSpeakTime = Date.now();
         speechSynthesis.speak(utt);
+        // One retry if Chrome silently dropped it
         setTimeout(function() {
-          if (speaking && !finished && !speechSynthesis.speaking && attempts < 3) {
-            speechSynthesis.cancel();
-            setTimeout(trySpeak, 80);
+          if (speaking && !finished && !speechSynthesis.speaking) {
+            var utt2 = makeUtterance(text, voiceLang);
+            utt2.onend = done; utt2.onerror = done;
+            speechSynthesis.speak(utt2);
           }
-        }, 250);
-      }
-
-      setTimeout(trySpeak, 80);
+        }, 300);
+      }, 80);
     }
   }
 
